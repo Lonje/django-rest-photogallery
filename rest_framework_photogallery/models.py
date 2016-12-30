@@ -24,31 +24,13 @@ from django.utils.encoding import python_2_unicode_compatible
 from django.core.validators import RegexValidator
 from django.contrib.sites.models import Site
 
-# Required PIL classes may or may not be available from the root namespace
-# depending on the installation method used.
-try:
-    import Image
-    import ImageFile
-    import ImageFilter
-    import ImageEnhance
-except ImportError:
-    try:
-        from PIL import Image
-        from PIL import ImageFile
-        from PIL import ImageFilter
-        from PIL import ImageEnhance
-    except ImportError:
-        raise ImportError(
-            'Photologue was unable to import the Python Imaging Library. Please confirm it`s installed and available '
-            'on your current Python path.')
-
 from sortedm2m.fields import SortedManyToManyField
 
-from .utils.reflection import add_reflection
-from .utils.watermark import apply_watermark
+#from .utils.reflection import add_reflection
+#from .utils.watermark import apply_watermark
 from .managers import GalleryQuerySet, PhotoQuerySet
 
-logger = logging.getLogger('photologue.models')
+logger = logging.getLogger('rest_framework_photogallery.models')
 
 # Default limit for gallery.latest
 LATEST_LIMIT = getattr(settings, 'PHOTOLOGUE_GALLERY_LATEST_LIMIT', None)
@@ -59,15 +41,8 @@ SAMPLE_SIZE = getattr(settings, 'PHOTOLOGUE_GALLERY_SAMPLE_SIZE', 5)
 # max_length setting for the ImageModel ImageField
 IMAGE_FIELD_MAX_LENGTH = getattr(settings, 'PHOTOLOGUE_IMAGE_FIELD_MAX_LENGTH', 100)
 
-# Path to sample image
-SAMPLE_IMAGE_PATH = getattr(settings, 'PHOTOLOGUE_SAMPLE_IMAGE_PATH', os.path.join(
-    os.path.dirname(__file__), 'res', 'sample.jpg'))
-
-# Modify image file buffer size.
-ImageFile.MAXBLOCK = getattr(settings, 'PHOTOLOGUE_MAXBLOCK', 256 * 2 ** 10)
-
 # Photologue image path relative to media root
-PHOTOLOGUE_DIR = getattr(settings, 'PHOTOLOGUE_DIR', 'photologue')
+PHOTOLOGUE_DIR = getattr(settings, 'PHOTOLOGUE_DIR', 'rest_framework_photogallery')
 
 # Look for user function to define file paths
 PHOTOLOGUE_PATH = getattr(settings, 'PHOTOLOGUE_PATH', None)
@@ -91,25 +66,6 @@ if not default_storage.exists(PHOTOLOGUE_CACHEDIRTAG):
     default_storage.save(PHOTOLOGUE_CACHEDIRTAG, ContentFile(
         "Signature: 8a477f597d28d172789f06886806bc55"))
 
-# Exif Orientation values
-# Value 0thRow	0thColumn
-#   1	top     left
-#   2	top     right
-#   3	bottom	right
-#   4	bottom	left
-#   5	left	top
-#   6	right   top
-#   7	right   bottom
-#   8	left    bottom
-
-# Image Orientations (according to EXIF informations) that needs to be
-# transposed and appropriate action
-IMAGE_EXIF_ORIENTATION_MAP = {
-    2: Image.FLIP_LEFT_RIGHT,
-    3: Image.ROTATE_180,
-    6: Image.ROTATE_270,
-    8: Image.ROTATE_90,
-}
 
 # Quality options for JPEG images
 JPEG_QUALITY_CHOICES = (
@@ -146,11 +102,6 @@ WATERMARK_STYLE_CHOICES = (
 
 # Prepare a list of image filters
 filter_names = []
-for n in dir(ImageFilter):
-    klass = getattr(ImageFilter, n)
-    if isclass(klass) and issubclass(klass, ImageFilter.BuiltinFilter) and \
-            hasattr(klass, 'name'):
-        filter_names.append(klass.__name__)
 IMAGE_FILTERS_HELP_TEXT = _('Chain multiple filters using the following pattern "FILTER_ONE->FILTER_TWO->FILTER_THREE"'
                             '. Image filters will be applied in order. The following filters are available: %s.'
                             % (', '.join(filter_names)))
@@ -190,7 +141,7 @@ class Gallery(models.Model):
                                     default=True,
                                     help_text=_('Public galleries will be displayed '
                                                 'in the default views.'))
-    photos = SortedManyToManyField('photologue.Photo',
+    photos = SortedManyToManyField('rest_framework_photogallery.Photo',
                                    related_name='galleries',
                                    verbose_name=_('photos'),
                                    blank=True)
@@ -207,9 +158,6 @@ class Gallery(models.Model):
 
     def __str__(self):
         return self.title
-
-    def get_absolute_url(self):
-        return reverse('photologue:pl-gallery', args=[self.slug])
 
     def latest(self, limit=LATEST_LIMIT, public=True):
         if not limit:
@@ -271,7 +219,7 @@ class ImageModel(models.Model):
                                  max_length=10,
                                  default='center',
                                  choices=CROP_ANCHOR_CHOICES)
-    effect = models.ForeignKey('photologue.PhotoEffect',
+    effect = models.ForeignKey('rest_framework_photogallery.PhotoEffect',
                                null=True,
                                blank=True,
                                related_name="%(class)s_related",
@@ -279,17 +227,6 @@ class ImageModel(models.Model):
 
     class Meta:
         abstract = True
-
-    def EXIF(self, file=None):
-        try:
-            if file:
-                tags = exifread.process_file(file)
-            else:
-                with self.image.storage.open(self.image.name, 'rb') as file:
-                    tags = exifread.process_file(file, details=False)
-            return tags
-        except:
-            return {}
 
     def admin_thumbnail(self):
         func = getattr(self, 'get_admin_thumbnail_url', None)
@@ -305,192 +242,19 @@ class ImageModel(models.Model):
     admin_thumbnail.short_description = _('Thumbnail')
     admin_thumbnail.allow_tags = True
 
-    def cache_path(self):
-        return os.path.join(os.path.dirname(self.image.name), "cache")
-
-    def cache_url(self):
-        return '/'.join([os.path.dirname(self.image.url), "cache"])
-
-    def image_filename(self):
-        return os.path.basename(force_text(self.image.name))
-
-    def _get_filename_for_size(self, size):
-        size = getattr(size, 'name', size)
-        base, ext = os.path.splitext(self.image_filename())
-        return ''.join([base, '_', size, ext])
-
-    def _get_SIZE_photosize(self, size):
-        return PhotoSizeCache().sizes.get(size)
-
-    def _get_SIZE_size(self, size):
-        photosize = PhotoSizeCache().sizes.get(size)
-        if not self.size_exists(photosize):
-            self.create_size(photosize)
-        return Image.open(self.image.storage.open(
-            self._get_SIZE_filename(size))).size
-
-    def _get_SIZE_url(self, size):
-        photosize = PhotoSizeCache().sizes.get(size)
-        if not self.size_exists(photosize):
-            self.create_size(photosize)
-        if photosize.increment_count:
-            self.increment_count()
-        return '/'.join([
-            self.cache_url(),
-            filepath_to_uri(self._get_filename_for_size(photosize.name))])
-
-    def _get_SIZE_filename(self, size):
-        photosize = PhotoSizeCache().sizes.get(size)
-        return smart_str(os.path.join(self.cache_path(),
-                                      self._get_filename_for_size(photosize.name)))
-
-    def increment_count(self):
-        self.view_count += 1
-        models.Model.save(self)
-
-    def __getattr__(self, name):
-        global size_method_map
-        if not size_method_map:
-            init_size_method_map()
-        di = size_method_map.get(name, None)
-        if di is not None:
-            result = curry(getattr(self, di['base_name']), di['size'])
-            setattr(self, name, result)
-            return result
-        else:
-            raise AttributeError
-
-    def size_exists(self, photosize):
-        func = getattr(self, "get_%s_filename" % photosize.name, None)
-        if func is not None:
-            if self.image.storage.exists(func()):
-                return True
-        return False
-
-    def resize_image(self, im, photosize):
-        cur_width, cur_height = im.size
-        new_width, new_height = photosize.size
-        if photosize.crop:
-            ratio = max(float(new_width) / cur_width, float(new_height) / cur_height)
-            x = (cur_width * ratio)
-            y = (cur_height * ratio)
-            xd = abs(new_width - x)
-            yd = abs(new_height - y)
-            x_diff = int(xd / 2)
-            y_diff = int(yd / 2)
-            if self.crop_from == 'top':
-                box = (int(x_diff), 0, int(x_diff + new_width), new_height)
-            elif self.crop_from == 'left':
-                box = (0, int(y_diff), new_width, int(y_diff + new_height))
-            elif self.crop_from == 'bottom':
-                # y - yd = new_height
-                box = (int(x_diff), int(yd), int(x_diff + new_width), int(y))
-            elif self.crop_from == 'right':
-                # x - xd = new_width
-                box = (int(xd), int(y_diff), int(x), int(y_diff + new_height))
-            else:
-                box = (int(x_diff), int(y_diff), int(x_diff + new_width), int(y_diff + new_height))
-            im = im.resize((int(x), int(y)), Image.ANTIALIAS).crop(box)
-        else:
-            if not new_width == 0 and not new_height == 0:
-                ratio = min(float(new_width) / cur_width,
-                            float(new_height) / cur_height)
-            else:
-                if new_width == 0:
-                    ratio = float(new_height) / cur_height
-                else:
-                    ratio = float(new_width) / cur_width
-            new_dimensions = (int(round(cur_width * ratio)),
-                              int(round(cur_height * ratio)))
-            if new_dimensions[0] > cur_width or \
-               new_dimensions[1] > cur_height:
-                if not photosize.upscale:
-                    return im
-            im = im.resize(new_dimensions, Image.ANTIALIAS)
-        return im
-
-    def create_size(self, photosize):
-        if self.size_exists(photosize):
-            return
+    def EXIF(self, file=None):
         try:
-            im = Image.open(self.image.storage.open(self.image.name))
-        except IOError:
-            return
-        # Save the original format
-        im_format = im.format
-        # Apply effect if found
-        if self.effect is not None:
-            im = self.effect.pre_process(im)
-        elif photosize.effect is not None:
-            im = photosize.effect.pre_process(im)
-        # Rotate if found & necessary
-        if 'Image Orientation' in self.EXIF() and \
-                self.EXIF().get('Image Orientation').values[0] in IMAGE_EXIF_ORIENTATION_MAP:
-            im = im.transpose(
-                IMAGE_EXIF_ORIENTATION_MAP[self.EXIF().get('Image Orientation').values[0]])
-        # Resize/crop image
-        if im.size != photosize.size and photosize.size != (0, 0):
-            im = self.resize_image(im, photosize)
-        # Apply watermark if found
-        if photosize.watermark is not None:
-            im = photosize.watermark.post_process(im)
-        # Apply effect if found
-        if self.effect is not None:
-            im = self.effect.post_process(im)
-        elif photosize.effect is not None:
-            im = photosize.effect.post_process(im)
-        # Save file
-        im_filename = getattr(self, "get_%s_filename" % photosize.name)()
-        try:
-            buffer = BytesIO()
-            if im_format != 'JPEG':
-                im.save(buffer, im_format)
+            if file:
+                tags = exifread.process_file(file)
             else:
-                im.save(buffer, 'JPEG', quality=int(photosize.quality),
-                        optimize=True)
-            buffer_contents = ContentFile(buffer.getvalue())
-            self.image.storage.save(im_filename, buffer_contents)
-        except IOError as e:
-            if self.image.storage.exists(im_filename):
-                self.image.storage.delete(im_filename)
-            raise e
-
-    def remove_size(self, photosize, remove_dirs=True):
-        if not self.size_exists(photosize):
-            return
-        filename = getattr(self, "get_%s_filename" % photosize.name)()
-        if self.image.storage.exists(filename):
-            self.image.storage.delete(filename)
-
-    def clear_cache(self):
-        cache = PhotoSizeCache()
-        for photosize in cache.sizes.values():
-            self.remove_size(photosize, False)
-
-    def pre_cache(self):
-        cache = PhotoSizeCache()
-        for photosize in cache.sizes.values():
-            if photosize.pre_cache:
-                self.create_size(photosize)
-
-    def __init__(self, *args, **kwargs):
-        super(ImageModel, self).__init__(*args, **kwargs)
-        self._old_image = self.image
+                with self.image.storage.open(self.image.name, 'rb') as file:
+                    tags = exifread.process_file(file, details=False)
+            return tags
+        except:
+            return {}
 
     def save(self, *args, **kwargs):
-        image_has_changed = False
-        if self._get_pk_val() and (self._old_image != self.image):
-            image_has_changed = True
-            # If we have changed the image, we need to clear from the cache all instances of the old
-            # image; clear_cache() works on the current (new) image, and in turn calls several other methods.
-            # Changing them all to act on the old image was a lot of changes, so instead we temporarily swap old
-            # and new images.
-            new_image = self.image
-            self.image = self._old_image
-            self.clear_cache()
-            self.image = new_image  # Back to the new image.
-            self._old_image.storage.delete(self._old_image.name)  # Delete (old) base image.
-        if self.date_taken is None or image_has_changed:
+        if self.date_taken is None:
             # Attempt to get the date the photo was taken from the EXIF data.
             try:
                 exif_date = self.EXIF(self.image.file).get('EXIF DateTimeOriginal', None)
@@ -503,20 +267,6 @@ class ImageModel(models.Model):
             except:
                 logger.error('Failed to read EXIF DateTimeOriginal', exc_info=True)
         super(ImageModel, self).save(*args, **kwargs)
-        self.pre_cache()
-
-    def delete(self):
-        assert self._get_pk_val() is not None, \
-            "%s object can't be deleted because its %s attribute is set to None." % \
-            (self._meta.object_name, self._meta.pk.attname)
-        self.clear_cache()
-        # Files associated to a FileField have to be manually deleted:
-        # https://docs.djangoproject.com/en/dev/releases/1.3/#deleting-a-model-doesn-t-delete-associated-files
-        # http://haineault.com/blog/147/
-        # The data loss scenarios mentioned in the docs hopefully do not apply
-        # to Photologue!
-        super(ImageModel, self).delete()
-        self.image.storage.delete(self.image.name)
 
 
 @python_2_unicode_compatible
@@ -555,7 +305,7 @@ class Photo(ImageModel):
         super(Photo, self).save(*args, **kwargs)
 
     def get_absolute_url(self):
-        return reverse('photologue:pl-photo', args=[self.slug])
+        return 'blah'
 
     def public_galleries(self):
         """Return the public galleries to which this photo belongs."""
@@ -812,12 +562,12 @@ class PhotoSize(models.Model):
                                           default=False,
                                           help_text=_('If selected the image\'s "view_count" will be incremented when '
                                                       'this photo size is displayed.'))
-    effect = models.ForeignKey('photologue.PhotoEffect',
+    effect = models.ForeignKey('rest_framework_photogallery.PhotoEffect',
                                null=True,
                                blank=True,
                                related_name='photo_sizes',
                                verbose_name=_('photo effect'))
-    watermark = models.ForeignKey('photologue.Watermark',
+    watermark = models.ForeignKey('rest_framework_photogallery.Watermark',
                                   null=True,
                                   blank=True,
                                   related_name='photo_sizes',
